@@ -1,1 +1,1 @@
-print("Hello world, from awefawef server!")
+print("Hello world, from web awefawef server!")
