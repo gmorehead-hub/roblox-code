@@ -48,6 +48,14 @@ KillerControlConfig.InitialDelaySeconds = 12
 -- How long a selected player controls the killer (seconds).
 KillerControlConfig.ControlDuration = 15
 
+--[[
+	If true, when the possessed killer *clone* dies (Humanoid health reaches 0),
+	possession ends immediately: player respawns as normal, killer template returns
+	to the map for AI, same as disconnect/timer cleanup. If false, the round keeps
+	going until ControlDuration even while dead (usually feels broken — keep true).
+]]
+KillerControlConfig.EndPossessionWhenKillerDies = true
+
 -- How long the system waits before selecting another player (seconds).
 KillerControlConfig.CooldownDuration = 100
 
@@ -130,6 +138,17 @@ KillerControlConfig.AttackRange = 12
 KillerControlConfig.AttackCooldown = 0.75
 
 --[[
+	AI fallback auto-attack
+	-----------------------
+	If your killer AI script does NOT manually fire:
+	  ServerStorage.KillerControlInternals.AiAttackRequested:Fire(killerModel)
+	this fallback loop can still trigger attacks while the killer is AI-controlled.
+]]
+KillerControlConfig.AiAutoAttackEnabled = true
+KillerControlConfig.AiAutoAttackRange = 12
+KillerControlConfig.AiAutoAttackCheckInterval = 0.2
+
+--[[
 	Attack swing animation (optional)
 	---------------------------------
 	Played on the SERVER when a possessed killer attack passes cooldown, so every
@@ -142,11 +161,31 @@ KillerControlConfig.AttackCooldown = 0.75
 
 	Set to nil (or 0 / "") to disable swing animation.
 ]]
-KillerControlConfig.AttackSwingAnimationId = nil
+KillerControlConfig.AttackSwingAnimationId = 133251285606576
 -- Blend-in time when starting the swing (seconds).
 KillerControlConfig.AttackSwingFadeTime = 0.1
 -- Playback speed (1 = normal).
 KillerControlConfig.AttackSwingSpeed = 1
+
+--[[
+	Attack sound feedback (simple + configurable)
+	---------------------------------------------
+	- AttackSwingSoundId: played every time the possessed killer swings
+	  after server cooldown validation (hit or miss).
+	- AttackHitSoundId: played only when damage is actually applied.
+
+	Use nil / 0 / "" to disable a sound.
+	Accepts:
+	- numeric asset id (example: 1234567890)
+	- full string (example: "rbxassetid://1234567890")
+]]
+KillerControlConfig.AttackSwingSoundId = 123796710194563
+KillerControlConfig.AttackSwingSoundVolume = 0.9
+KillerControlConfig.AttackSwingSoundRollOffMaxDistance = 80
+
+KillerControlConfig.AttackHitSoundId = 140721035016341
+KillerControlConfig.AttackHitSoundVolume = 1
+KillerControlConfig.AttackHitSoundRollOffMaxDistance = 80
 
 -- Set true while testing to print every attack + whether anyone was in range.
 KillerControlConfig.DebugAttacks = true

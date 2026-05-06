@@ -12,6 +12,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local ServerStorage = game:GetService("ServerStorage")
+local Debris = game:GetService("Debris")
 
 -- Shared modules should live in ReplicatedStorage so both server and client can require them.
 local SharedFolder = ReplicatedStorage:WaitForChild("Shared")
@@ -75,6 +76,7 @@ local activePossessionCleanup: (() -> ())? = nil
 local disconnectingPossessedUserIds: { [number]: boolean } = {}
 
 local lastAttackAtByUserId: { [number]: number } = {}
+local lastAttackAtByKillerModel: { [Model]: number } = {}
 local NO_ELIGIBLE_RETRY_SECONDS = 2
 
 --[[
@@ -377,6 +379,17 @@ if not roundStartSignal then
 	roundStartSignal.Parent = killerControlInternals
 end
 
+-- AI scripts can fire this to use the exact same attack logic as possession attacks.
+local aiAttackRequestedSignal = killerControlInternals:FindFirstChild("AiAttackRequested")
+if not aiAttackRequestedSignal then
+	aiAttackRequestedSignal = Instance.new("BindableEvent")
+	aiAttackRequestedSignal.Name = "AiAttackRequested"
+	aiAttackRequestedSignal.Parent = killerControlInternals
+end
+
+-- Forward declaration: Humanoid.Died during possession calls this before it is assigned below.
+local runPossessionCleanup: (reason: string) -> ()
+
 --[[
 	Starts possession:
 	- finds the killer template in Workspace
@@ -422,15 +435,40 @@ local function startPlayerPossession(player: Player): (() -> ())?
 	print(("[KillerControl] %s now controls killer clone."):format(player.Name))
 
 	--[[
+		If the killer clone dies mid-possession, end the round early.
+		Otherwise the main loop still waits ControlDuration while the player is dead,
+		and the stashed template can get out of sync with gameplay expectations.
+	]]
+	local killerDiedConnection: RBXScriptConnection? = nil
+	local possessionHumanoid = possessionKiller:FindFirstChildOfClass("Humanoid")
+	if possessionHumanoid and KillerControlConfig.EndPossessionWhenKillerDies ~= false then
+		killerDiedConnection = possessionHumanoid.Died:Connect(function()
+			if killerDiedConnection then
+				killerDiedConnection:Disconnect()
+				killerDiedConnection = nil
+			end
+			if activePossessionCleanup then
+				runPossessionCleanup("possessed killer died")
+			end
+		end)
+	end
+
+	--[[
 		Return a cleanup function to guarantee consistent restoration path.
 		Safe to call from:
 		- the normal timer after ControlDuration
 		- PlayerRemoving if the possessed player disconnects early
+		- Humanoid.Died on the possessed killer clone (if enabled in config)
 
 		When the player has left, we still must restore the killer NPC to the map;
 		we only skip client-only steps (end remote + respawn).
 	]]
 	return function()
+		if killerDiedConnection then
+			killerDiedConnection:Disconnect()
+			killerDiedConnection = nil
+		end
+
 		activePossessingPlayer = nil
 		activeKillerModel = nil
 
@@ -474,9 +512,9 @@ end
 
 --[[
 	Runs the active possession cleanup once, then clears the handle.
-	`reason` is only for logging (timer vs disconnect vs manual).
+	`reason` is only for logging (timer vs disconnect vs killer death).
 ]]
-local function runPossessionCleanup(reason: string)
+runPossessionCleanup = function(reason: string)
 	if not activePossessionCleanup then
 		return
 	end
@@ -489,11 +527,9 @@ local function runPossessionCleanup(reason: string)
 end
 
 --[[
-	Resolves KillerControlConfig.AttackSwingAnimationId to a full rbxassetid URL, or nil.
-	Accepts a number (asset id), "rbxassetid://...", or numeric string.
+	Normalizes config values to full rbxassetid:// URLs (sounds, animations, images).
 ]]
-local function getAttackSwingAnimationUrl(): string?
-	local v = KillerControlConfig.AttackSwingAnimationId
+local function toRbxAssetUrl(v: any): string?
 	if v == nil or v == "" or v == 0 then
 		return nil
 	end
@@ -510,6 +546,37 @@ local function getAttackSwingAnimationUrl(): string?
 		end
 	end
 	return nil
+end
+
+local function getAttackSwingAnimationUrl(): string?
+	return toRbxAssetUrl(KillerControlConfig.AttackSwingAnimationId)
+end
+
+-- Plays a short 3D one-shot sound for nearby players.
+local function playAttackSound(parentPart: BasePart, soundIdValue: any, volume: number, maxDistance: number)
+	local soundUrl = toRbxAssetUrl(soundIdValue)
+	if not soundUrl then
+		if KillerControlConfig.DebugAttacks then
+			warn("[KillerControl] Attack sound skipped: sound id is nil/invalid.")
+		end
+		return
+	end
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = soundUrl
+	sound.Volume = volume
+	sound.RollOffMode = Enum.RollOffMode.InverseTapered
+	sound.RollOffMaxDistance = maxDistance
+	sound.Parent = parentPart
+
+	if KillerControlConfig.DebugAttacks then
+		print(("[KillerControl] Playing attack sound: %s"):format(soundUrl))
+	end
+
+	sound:Play()
+
+	-- Auto cleanup for temporary sound instances.
+	Debris:AddItem(sound, 3)
 end
 
 --[[
@@ -568,15 +635,13 @@ end
 
 --[[
 	Server-authoritative melee hit handling.
-	Client only says "I tried to attack" and server decides whether it is valid.
+	Both player possession and AI call this same function so attacks behave identically:
+	- same cooldown rule
+	- same swing animation/sounds
+	- same nearest-target hit detection
+	- same damage application
 ]]
-AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
-	-- Only the currently selected possessed player can attack.
-	if activePossessingPlayer ~= player then
-		return
-	end
-
-	local killerModel = activeKillerModel
+local function performKillerAttack(killerModel: Model, attackerPlayer: Player?)
 	if not killerModel or killerModel.Parent == nil then
 		return
 	end
@@ -587,23 +652,42 @@ AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
 		return
 	end
 
-	-- Anti-spam cooldown per player (server side).
+	-- Shared anti-spam cooldown:
+	-- - possession attacks: key by attacker user id
+	-- - AI attacks: key by killer model instance
 	local now = os.clock()
-	local lastAttackAt = lastAttackAtByUserId[player.UserId] or 0
+	local lastAttackAt: number
+	if attackerPlayer then
+		lastAttackAt = lastAttackAtByUserId[attackerPlayer.UserId] or 0
+	else
+		lastAttackAt = lastAttackAtByKillerModel[killerModel] or 0
+	end
+
 	if now - lastAttackAt < KillerControlConfig.AttackCooldown then
 		return
 	end
-	lastAttackAtByUserId[player.UserId] = now
+
+	if attackerPlayer then
+		lastAttackAtByUserId[attackerPlayer.UserId] = now
+	else
+		lastAttackAtByKillerModel[killerModel] = now
+	end
 
 	-- Visual feedback for everyone (hits and misses); requires valid uploaded AnimationId in config.
 	playKillerSwingAnimation(killerModel)
+	playAttackSound(
+		killerRoot,
+		KillerControlConfig.AttackSwingSoundId,
+		KillerControlConfig.AttackSwingSoundVolume,
+		KillerControlConfig.AttackSwingSoundRollOffMaxDistance
+	)
 
 	-- Hit the single closest valid victim in range (simple melee feel).
 	local bestHumanoid: Humanoid? = nil
 	local bestDistance = KillerControlConfig.AttackRange
 
 	for _, otherPlayer in Players:GetPlayers() do
-		if otherPlayer ~= player then
+		if attackerPlayer == nil or otherPlayer ~= attackerPlayer then
 			local otherCharacter = otherPlayer.Character
 			if otherCharacter then
 				local otherHumanoid = otherCharacter:FindFirstChildOfClass("Humanoid")
@@ -622,6 +706,17 @@ AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
 
 	if bestHumanoid then
 		bestHumanoid:TakeDamage(KillerControlConfig.AttackDamage)
+
+		local victimRoot = bestHumanoid.Parent and bestHumanoid.Parent:FindFirstChild("HumanoidRootPart")
+		if victimRoot and victimRoot:IsA("BasePart") then
+			playAttackSound(
+				victimRoot,
+				KillerControlConfig.AttackHitSoundId,
+				KillerControlConfig.AttackHitSoundVolume,
+				KillerControlConfig.AttackHitSoundRollOffMaxDistance
+			)
+		end
+
 		if KillerControlConfig.DebugAttacks then
 			print(
 				("[KillerControl] Attack hit %s for %d damage (dist %.1f)."):format(
@@ -637,6 +732,74 @@ AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
 				KillerControlConfig.AttackRange
 			)
 		)
+	end
+end
+
+-- Possessed player path -> same shared attack logic.
+AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
+	if activePossessingPlayer ~= player then
+		return
+	end
+
+	local killerModel = activeKillerModel
+	if not killerModel then
+		return
+	end
+
+	performKillerAttack(killerModel, player)
+end)
+
+-- AI path -> any server AI script can fire this bindable with the killer model.
+-- Example from an AI script:
+-- ServerStorage.KillerControlInternals.AiAttackRequested:Fire(script.Parent)
+aiAttackRequestedSignal.Event:Connect(function(killerModel: Model)
+	if typeof(killerModel) ~= "Instance" or not killerModel:IsA("Model") then
+		return
+	end
+
+	performKillerAttack(killerModel, nil)
+end)
+
+--[[
+	Fallback AI attack loop:
+	- Runs only when nobody is possessing the killer
+	- If any alive player is close enough to the AI killer, it triggers the
+	  same shared attack function used by human possession attacks.
+	- This keeps behavior working even if marketplace AI scripts don't call the bindable.
+]]
+task.spawn(function()
+	while true do
+		if KillerControlConfig.AiAutoAttackEnabled and activePossessingPlayer == nil then
+			local killerModel = getKillerModelForPossession()
+			if killerModel then
+				local killerHumanoid = killerModel:FindFirstChildOfClass("Humanoid")
+				local killerRoot = killerModel:FindFirstChild("HumanoidRootPart") or killerModel.PrimaryPart
+
+				if killerHumanoid and killerHumanoid.Health > 0 and killerRoot then
+					local targetInRange = false
+					for _, player in Players:GetPlayers() do
+						local character = player.Character
+						if character then
+							local humanoid = character:FindFirstChildOfClass("Humanoid")
+							local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+							if humanoid and humanoid.Health > 0 and root then
+								local distance = (root.Position - killerRoot.Position).Magnitude
+								if distance <= KillerControlConfig.AiAutoAttackRange then
+									targetInRange = true
+									break
+								end
+							end
+						end
+					end
+
+					if targetInRange then
+						performKillerAttack(killerModel, nil)
+					end
+				end
+			end
+		end
+
+		task.wait(KillerControlConfig.AiAutoAttackCheckInterval)
 	end
 end)
 
