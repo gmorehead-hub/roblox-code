@@ -199,7 +199,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEv
 end)
 
 -- Mobile support: tap anywhere to attack while possessing.
-UserInputService.TouchTap:Connect(function(_touchPositions: {Vector2}, gameProcessedEvent: boolean)
+UserInputService.TouchTap:Connect(function(_touchPositions: { Vector2 }, gameProcessedEvent: boolean)
 	if gameProcessedEvent or not isPossessingKiller then
 		return
 	end
