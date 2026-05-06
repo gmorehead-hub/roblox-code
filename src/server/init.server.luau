@@ -1,8 +1,12 @@
 --[[
-	Server bootstrap (step 1)
-	-------------------------
-	For now, we only load and verify killer-control config values.
-	We'll plug this into the full possession system in the next steps.
+	Killer control — SERVER entry script
+	------------------------------------
+	This file runs on the server only. Tunable numbers and staff rules are NOT
+	edited here for day-to-day work — they live in:
+	  src/shared/KillerControlConfig.luau
+	Read that file's header and "Staff / admin exclusion" section first.
+
+	This script: remotes, eligibility, possession loop, combat validation, cleanup.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -68,9 +72,9 @@ local activePossessionCleanup: (() -> ())? = nil
 	player. The cleanup function reads this to skip FireClient / LoadCharacterAsync
 	(which error or misbehave when the session is already ending).
 ]]
-local disconnectingPossessedUserIds: {[number]: boolean} = {}
+local disconnectingPossessedUserIds: { [number]: boolean } = {}
 
-local lastAttackAtByUserId: {[number]: number} = {}
+local lastAttackAtByUserId: { [number]: number } = {}
 local NO_ELIGIBLE_RETRY_SECONDS = 2
 
 --[[
@@ -80,8 +84,8 @@ local NO_ELIGIBLE_RETRY_SECONDS = 2
 	2) It tolerates missing/invalid config values instead of erroring.
 	3) It avoids duplicate IDs and warns when entries are invalid.
 ]]
-local function buildExcludedUserIdSet(rawList: {any}?): {[number]: boolean}
-	local excludedSet: {[number]: boolean} = {}
+local function buildExcludedUserIdSet(rawList: { any }?): { [number]: boolean }
+	local excludedSet: { [number]: boolean } = {}
 
 	-- If list is missing or not a table, treat it as "no exclusions".
 	if type(rawList) ~= "table" then
@@ -94,8 +98,7 @@ local function buildExcludedUserIdSet(rawList: {any}?): {[number]: boolean}
 			excludedSet[userIdValue] = true
 		else
 			warn(
-				("[KillerControl] Ignoring invalid ExcludedUserIds[%d] value: %s")
-					:format(index, tostring(userIdValue))
+				("[KillerControl] Ignoring invalid ExcludedUserIds[%d] value: %s"):format(index, tostring(userIdValue))
 			)
 		end
 	end
@@ -104,6 +107,108 @@ local function buildExcludedUserIdSet(rawList: {any}?): {[number]: boolean}
 end
 
 local excludedUserIdSet = buildExcludedUserIdSet(KillerControlConfig.ExcludedUserIds)
+
+--[[
+	-------------------------------------------------------------------------
+	Staff exclusion (Owner / Admin / Mod, etc.) — implementation, not config
+	-------------------------------------------------------------------------
+	To ADD or CHANGE who counts as staff, edit ONLY KillerControlConfig.luau:
+	  StaffGroupId, StaffExcludedRanks, ExcludePublishedExperienceCreator,
+	  StaffPlayerAttributeName, StaffPlayerAttributeMustEqual
+
+	Below: builds fast lookup tables and caches each player's group rank when
+	they join (GetRankInGroupAsync). isExcludedByStaffRole() is called from
+	isPlayerEligible() AFTER ExcludedUserIds.
+
+	Do not hard-code rank numbers here — keep them in the shared config so
+	designers and new devs have one place to look.
+]]
+local staffExcludedRankSet: { [number]: boolean } = {}
+if type(KillerControlConfig.StaffExcludedRanks) == "table" then
+	for _, rankValue in KillerControlConfig.StaffExcludedRanks do
+		if type(rankValue) == "number" and rankValue > 0 then
+			staffExcludedRankSet[rankValue] = true
+		end
+	end
+end
+
+--[[
+	Cached group ranks (filled asynchronously via GetRankInGroupAsync).
+	Key = UserId, value = rank number from Roblox for StaffGroupId (0 = not in group).
+]]
+local groupRankByUserId: { [number]: number } = {}
+
+--[[
+	Refresh one player's rank for StaffGroupId. Must be async — Roblox deprecated the
+	synchronous GetRankInGroup API.
+]]
+local function refreshGroupRankForPlayer(player: Player)
+	local groupId = KillerControlConfig.StaffGroupId
+	if type(groupId) ~= "number" or groupId <= 0 then
+		return
+	end
+
+	task.spawn(function()
+		local ok, rankOrErr = pcall(function()
+			return player:GetRankInGroupAsync(groupId)
+		end)
+		if not player.Parent then
+			return
+		end
+		if ok and type(rankOrErr) == "number" then
+			groupRankByUserId[player.UserId] = rankOrErr
+		else
+			groupRankByUserId[player.UserId] = 0
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	refreshGroupRankForPlayer(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	groupRankByUserId[player.UserId] = nil
+end)
+
+for _, existingPlayer in Players:GetPlayers() do
+	refreshGroupRankForPlayer(existingPlayer)
+end
+
+--[[
+	True = this player must not be killer (staff / creator / attribute rules).
+	Config-driven — see KillerControlConfig. Server-only; clients cannot spoof.
+]]
+local function isExcludedByStaffRole(player: Player): boolean
+	local attrName = KillerControlConfig.StaffPlayerAttributeName
+	if type(attrName) == "string" and attrName ~= "" then
+		local expected = KillerControlConfig.StaffPlayerAttributeMustEqual
+		local attrValue = player:GetAttribute(attrName)
+		if attrValue == expected then
+			return true
+		end
+	end
+
+	if KillerControlConfig.ExcludePublishedExperienceCreator then
+		if game.CreatorType == Enum.CreatorType.User then
+			local cid = game.CreatorId
+			if cid ~= 0 and player.UserId == cid then
+				return true
+			end
+		end
+	end
+
+	local groupId = KillerControlConfig.StaffGroupId
+	if type(groupId) == "number" and groupId > 0 and next(staffExcludedRankSet) ~= nil then
+		local rankInGroup = groupRankByUserId[player.UserId]
+		-- While rank is still loading, we don't treat them as staff (rare short window).
+		if type(rankInGroup) == "number" and rankInGroup > 0 and staffExcludedRankSet[rankInGroup] then
+			return true
+		end
+	end
+
+	return false
+end
 
 -- Convert lookup-map keys into a readable comma-separated debug string.
 local excludedUserIdTextParts = {}
@@ -120,13 +225,26 @@ print(
 	(#excludedUserIdTextParts > 0) and table.concat(excludedUserIdTextParts, ", ") or "(none)"
 )
 
+local staffRankParts = {}
+for rank in staffExcludedRankSet do
+	table.insert(staffRankParts, tostring(rank))
+end
+print("[KillerControl] StaffGroupId:", KillerControlConfig.StaffGroupId)
+print(
+	"[KillerControl] StaffExcludedRanks:",
+	(#staffRankParts > 0) and table.concat(staffRankParts, ", ") or "(none — set StaffGroupId + StaffExcludedRanks)"
+)
+
 --[[
-	Returns true when a player can be selected for killer control.
-	For now we only enforce exclusions + basic character/humanoid health checks.
-	We keep this as a separate function so future rules are easy to add.
+	True when this player may be randomly picked as killer.
+	Order: (1) ExcludedUserIds  (2) staff rules in config  (3) alive character
 ]]
 local function isPlayerEligible(player: Player): boolean
 	if excludedUserIdSet[player.UserId] then
+		return false
+	end
+
+	if isExcludedByStaffRole(player) then
 		return false
 	end
 
@@ -144,7 +262,7 @@ local function isPlayerEligible(player: Player): boolean
 end
 
 -- Collect all currently eligible players into an array for random picking.
-local function getEligiblePlayers(): {Player}
+local function getEligiblePlayers(): { Player }
 	local eligiblePlayers = {}
 
 	for _, player in Players:GetPlayers() do
@@ -177,10 +295,7 @@ end
 local function getKillerModelForPossession(): Model?
 	local killerModel = workspace:FindFirstChild(KillerControlConfig.KillerModelName)
 	if not killerModel or not killerModel:IsA("Model") then
-		warn(
-			("[KillerControl] Killer model '%s' not found in Workspace.")
-				:format(KillerControlConfig.KillerModelName)
-		)
+		warn(("[KillerControl] Killer model '%s' not found in Workspace."):format(KillerControlConfig.KillerModelName))
 		return nil
 	end
 
@@ -203,8 +318,8 @@ end
 	  character slide around with frozen limbs (no walk/idle animation).
 	- Client-run animation should keep running on the possessed rig.
 ]]
-local function disableKillerAiScripts(killerModel: Model): {[BaseScript]: boolean}
-	local previousDisabledStateByScript: {[BaseScript]: boolean} = {}
+local function disableKillerAiScripts(killerModel: Model): { [BaseScript]: boolean }
+	local previousDisabledStateByScript: { [BaseScript]: boolean } = {}
 
 	for _, descendant in killerModel:GetDescendants() do
 		-- Only ServerScriptService-style Scripts run on the server; skip LocalScripts.
@@ -224,7 +339,7 @@ local function disableKillerAiScripts(killerModel: Model): {[BaseScript]: boolea
 end
 
 -- Restore script states captured by disableKillerAiScripts.
-local function restoreKillerAiScripts(previousDisabledStateByScript: {[BaseScript]: boolean})
+local function restoreKillerAiScripts(previousDisabledStateByScript: { [BaseScript]: boolean })
 	for scriptObject, previousDisabled in previousDisabledStateByScript do
 		if scriptObject.Parent ~= nil then
 			scriptObject.Disabled = previousDisabled
@@ -374,6 +489,84 @@ local function runPossessionCleanup(reason: string)
 end
 
 --[[
+	Resolves KillerControlConfig.AttackSwingAnimationId to a full rbxassetid URL, or nil.
+	Accepts a number (asset id), "rbxassetid://...", or numeric string.
+]]
+local function getAttackSwingAnimationUrl(): string?
+	local v = KillerControlConfig.AttackSwingAnimationId
+	if v == nil or v == "" or v == 0 then
+		return nil
+	end
+	if type(v) == "number" and v > 0 then
+		return "rbxassetid://" .. tostring(v)
+	end
+	if type(v) == "string" then
+		if string.sub(v, 1, 13) == "rbxassetid://" then
+			return v
+		end
+		local n = tonumber(v)
+		if n and n > 0 then
+			return "rbxassetid://" .. tostring(n)
+		end
+	end
+	return nil
+end
+
+--[[
+	Cached AnimationTracks per Animator (one track per possessed killer rig).
+	Playing from the server replicates to all clients for that character.
+]]
+local swingTrackByAnimator: { [Animator]: AnimationTrack } = {}
+
+--[[
+	Plays the configured melee swing on the killer model (if AttackSwingAnimationId is set).
+	Called once per accepted attack after cooldown — includes whiffs so the killer still animates.
+]]
+local function playKillerSwingAnimation(killerModel: Model)
+	local url = getAttackSwingAnimationUrl()
+	if not url then
+		return
+	end
+
+	local humanoid = killerModel:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = humanoid
+	end
+
+	local track = swingTrackByAnimator[animator]
+	if not track then
+		local anim = Instance.new("Animation")
+		anim.AnimationId = url
+		local ok, loaded = pcall(function()
+			return animator:LoadAnimation(anim)
+		end)
+		anim:Destroy()
+		if not ok or not loaded then
+			if KillerControlConfig.DebugAttacks then
+				warn(
+					"[KillerControl] Failed to LoadAnimation for swing — check AttackSwingAnimationId / permissions."
+				)
+			end
+			return
+		end
+		track = loaded
+		swingTrackByAnimator[animator] = track
+	end
+
+	local fade = KillerControlConfig.AttackSwingFadeTime
+	local speed = KillerControlConfig.AttackSwingSpeed
+	pcall(function()
+		track:Play(fade, 1, speed)
+	end)
+end
+
+--[[
 	Server-authoritative melee hit handling.
 	Client only says "I tried to attack" and server decides whether it is valid.
 ]]
@@ -402,6 +595,9 @@ AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
 	end
 	lastAttackAtByUserId[player.UserId] = now
 
+	-- Visual feedback for everyone (hits and misses); requires valid uploaded AnimationId in config.
+	playKillerSwingAnimation(killerModel)
+
 	-- Hit the single closest valid victim in range (simple melee feel).
 	local bestHumanoid: Humanoid? = nil
 	local bestDistance = KillerControlConfig.AttackRange
@@ -428,13 +624,18 @@ AttackRequestedEvent.OnServerEvent:Connect(function(player: Player)
 		bestHumanoid:TakeDamage(KillerControlConfig.AttackDamage)
 		if KillerControlConfig.DebugAttacks then
 			print(
-				("[KillerControl] Attack hit %s for %d damage (dist %.1f).")
-					:format(bestHumanoid.Parent and bestHumanoid.Parent.Name or "?", KillerControlConfig.AttackDamage, bestDistance)
+				("[KillerControl] Attack hit %s for %d damage (dist %.1f)."):format(
+					bestHumanoid.Parent and bestHumanoid.Parent.Name or "?",
+					KillerControlConfig.AttackDamage,
+					bestDistance
+				)
 			)
 		end
 	elseif KillerControlConfig.DebugAttacks then
 		print(
-			("[KillerControl] Attack missed — no player in range (range=%.1f)."):format(KillerControlConfig.AttackRange)
+			("[KillerControl] Attack missed — no player in range (range=%.1f)."):format(
+				KillerControlConfig.AttackRange
+			)
 		)
 	end
 end)
@@ -485,8 +686,9 @@ task.spawn(function()
 	-- Optional: delay after server boot (and after manual start, if used).
 	if KillerControlConfig.InitialDelaySeconds > 0 then
 		print(
-			("[KillerControl] Initial delay: %ds before first selection.")
-				:format(KillerControlConfig.InitialDelaySeconds)
+			("[KillerControl] Initial delay: %ds before first selection."):format(
+				KillerControlConfig.InitialDelaySeconds
+			)
 		)
 		task.wait(KillerControlConfig.InitialDelaySeconds)
 	end
@@ -497,10 +699,7 @@ task.spawn(function()
 		local selectedPlayer = selectRandomEligiblePlayer()
 
 		if selectedPlayer then
-			print(
-				("[KillerControl] Selected player: %s (%d)")
-					:format(selectedPlayer.Name, selectedPlayer.UserId)
-			)
+			print(("[KillerControl] Selected player: %s (%d)"):format(selectedPlayer.Name, selectedPlayer.UserId))
 
 			local cleanupPossession = startPlayerPossession(selectedPlayer)
 			if cleanupPossession then
@@ -512,18 +711,12 @@ task.spawn(function()
 			end
 		else
 			print("[KillerControl] No eligible players currently available.")
-			print(
-				("[KillerControl] Retrying in %ds (not starting full cooldown).")
-					:format(NO_ELIGIBLE_RETRY_SECONDS)
-			)
+			print(("[KillerControl] Retrying in %ds (not starting full cooldown)."):format(NO_ELIGIBLE_RETRY_SECONDS))
 			task.wait(NO_ELIGIBLE_RETRY_SECONDS)
 			continue
 		end
 
-		print(
-			("[KillerControl] Cooldown started (%ds).")
-				:format(KillerControlConfig.CooldownDuration)
-		)
+		print(("[KillerControl] Cooldown started (%ds)."):format(KillerControlConfig.CooldownDuration))
 		task.wait(KillerControlConfig.CooldownDuration)
 	end
 end)
