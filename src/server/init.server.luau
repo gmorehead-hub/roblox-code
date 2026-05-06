@@ -13,6 +13,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local ServerStorage = game:GetService("ServerStorage")
 local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
 
 -- Shared modules should live in ReplicatedStorage so both server and client can require them.
 local SharedFolder = ReplicatedStorage:WaitForChild("Shared")
@@ -409,9 +410,16 @@ local function startPlayerPossession(player: Player): (() -> ())?
 	if not originalCharacter then
 		return nil
 	end
+	local originalHumanoid = originalCharacter:FindFirstChildOfClass("Humanoid")
 
 	local previousKillerName = killerTemplate.Name
 	local stashPivot = killerTemplate:GetPivot()
+	local templateHumanoid = killerTemplate:FindFirstChildOfClass("Humanoid")
+	local originalCharacterPivot = originalCharacter:GetPivot()
+	local originalPlayerHealth: number? = nil
+	if originalHumanoid then
+		originalPlayerHealth = originalHumanoid.Health
+	end
 
 	-- Clone is what the player actually controls; template stays intact for later AI.
 	local possessionKiller = killerTemplate:Clone()
@@ -441,6 +449,39 @@ local function startPlayerPossession(player: Player): (() -> ())?
 	]]
 	local killerDiedConnection: RBXScriptConnection? = nil
 	local possessionHumanoid = possessionKiller:FindFirstChildOfClass("Humanoid")
+	local templateHealthConnection: RBXScriptConnection? = nil
+	local possessionHealthConnection: RBXScriptConnection? = nil
+	local possessionPivotTrackConnection: RBXScriptConnection? = nil
+	local syncingHealth = false
+	local lastPossessionPivot = stashPivot
+
+	-- Keep template and possessed clone health in sync so damage from either side persists.
+	local function syncHumanoidHealth(fromHumanoid: Humanoid, toHumanoid: Humanoid)
+		if syncingHealth then
+			return
+		end
+		syncingHealth = true
+		toHumanoid.MaxHealth = fromHumanoid.MaxHealth
+		toHumanoid.Health = math.clamp(fromHumanoid.Health, 0, toHumanoid.MaxHealth)
+		syncingHealth = false
+	end
+
+	if templateHumanoid and possessionHumanoid then
+		syncHumanoidHealth(templateHumanoid, possessionHumanoid)
+		templateHealthConnection = templateHumanoid.HealthChanged:Connect(function()
+			syncHumanoidHealth(templateHumanoid, possessionHumanoid)
+		end)
+		possessionHealthConnection = possessionHumanoid.HealthChanged:Connect(function()
+			syncHumanoidHealth(possessionHumanoid, templateHumanoid)
+		end)
+	end
+
+	possessionPivotTrackConnection = RunService.Heartbeat:Connect(function()
+		if possessionKiller.Parent then
+			lastPossessionPivot = possessionKiller:GetPivot()
+		end
+	end)
+
 	if possessionHumanoid and KillerControlConfig.EndPossessionWhenKillerDies ~= false then
 		killerDiedConnection = possessionHumanoid.Died:Connect(function()
 			if killerDiedConnection then
@@ -468,6 +509,18 @@ local function startPlayerPossession(player: Player): (() -> ())?
 			killerDiedConnection:Disconnect()
 			killerDiedConnection = nil
 		end
+		if templateHealthConnection then
+			templateHealthConnection:Disconnect()
+			templateHealthConnection = nil
+		end
+		if possessionHealthConnection then
+			possessionHealthConnection:Disconnect()
+			possessionHealthConnection = nil
+		end
+		if possessionPivotTrackConnection then
+			possessionPivotTrackConnection:Disconnect()
+			possessionPivotTrackConnection = nil
+		end
 
 		activePossessingPlayer = nil
 		activeKillerModel = nil
@@ -482,15 +535,24 @@ local function startPlayerPossession(player: Player): (() -> ())?
 				-- Still check Parent in case they leave before this thread runs.
 				if player.Parent == Players then
 					player:LoadCharacterAsync()
+					local newCharacter = player.Character
+					if not newCharacter then
+						newCharacter = player.CharacterAdded:Wait()
+					end
+					if newCharacter and newCharacter.Parent then
+						pcall(function()
+							newCharacter:PivotTo(originalCharacterPivot)
+						end)
+						local newHumanoid = newCharacter:FindFirstChildOfClass("Humanoid")
+						if newHumanoid and originalPlayerHealth then
+							newHumanoid.Health = math.clamp(originalPlayerHealth, 0, newHumanoid.MaxHealth)
+						end
+					end
 				end
 			end)
 		end
 
-		-- Prefer the clone's last position; if Roblox already removed it, fall back.
-		local endPivot = stashPivot
-		if possessionKiller.Parent then
-			endPivot = possessionKiller:GetPivot()
-		end
+		local endPivot = lastPossessionPivot
 
 		pcall(function()
 			possessionKiller:Destroy()
