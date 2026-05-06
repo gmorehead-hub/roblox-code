@@ -24,6 +24,36 @@
 local KillerControlConfig = {}
 
 --[[
+	QUICK CUSTOMIZATION MAP
+	-----------------------
+	Most common edits (open this file, change values, save, sync):
+	1) Timing:
+	   - InitialDelaySeconds
+	   - ControlDuration
+	   - CooldownDuration
+	2) Who can be killer:
+	   - ExcludedUserIds
+	   - StaffGroupId / StaffExcludedRanks
+	   - StaffPlayerAttributeName (optional admin-kit bridge)
+	3) Combat feel:
+	   - AttackDamage
+	   - AttackRange
+	   - AttackCooldown
+	4) AI behavior:
+	   - AiAutoAttackEnabled
+	   - AiAutoAttackRange
+	   - AiAutoAttackCheckInterval
+	5) Presentation:
+	   - AttackSwingAnimationId / fade / speed
+	   - AttackSwingSoundId / AttackHitSoundId (+ volume / distance)
+
+	Recommended workflow for new contributors:
+	- Change one section at a time
+	- Keep DebugAttacks = true while tuning combat/audio
+	- Test with at least 2 players (or local server + client)
+]]
+
+--[[
 	When to start the killer scheduling loop
 	-----------------------------------------
 	- InitialDelaySeconds: waits this long after the conditions below are met,
