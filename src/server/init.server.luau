@@ -640,6 +640,13 @@ end
 	- same swing animation/sounds
 	- same nearest-target hit detection
 	- same damage application
+
+	DEV NOTE (where to customize, safely):
+	- Tune numbers (damage/range/cooldown/sounds/animation) in shared config, not here.
+	- If you want different targeting rules (cone, raycast, team checks), edit only the
+	  "bestHumanoid" selection block below.
+	- If AI should attack less/more often, prefer changing AiAutoAttack* config values
+	  and leave performKillerAttack untouched so player/AI parity stays intact.
 ]]
 local function performKillerAttack(killerModel: Model, attackerPlayer: Player?)
 	if not killerModel or killerModel.Parent == nil then
@@ -752,6 +759,10 @@ end)
 -- AI path -> any server AI script can fire this bindable with the killer model.
 -- Example from an AI script:
 -- ServerStorage.KillerControlInternals.AiAttackRequested:Fire(script.Parent)
+-- Why this exists:
+-- - Marketplace AI scripts are inconsistent. Some have no clean attack event.
+-- - This gives a stable API entrypoint so future AI rewrites can still reuse
+--   the same shared attack function without duplicating combat logic.
 aiAttackRequestedSignal.Event:Connect(function(killerModel: Model)
 	if typeof(killerModel) ~= "Instance" or not killerModel:IsA("Model") then
 		return
@@ -766,6 +777,11 @@ end)
 	- If any alive player is close enough to the AI killer, it triggers the
 	  same shared attack function used by human possession attacks.
 	- This keeps behavior working even if marketplace AI scripts don't call the bindable.
+
+	To replace this with your own AI:
+	1) Set AiAutoAttackEnabled = false in KillerControlConfig
+	2) From your AI script, call AiAttackRequested:Fire(killerModel) when your
+	   pathfinding/targeting logic decides to attack
 ]]
 task.spawn(function()
 	while true do
